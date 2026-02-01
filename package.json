@@ -1,0 +1,38 @@
+{
+  "name": "6-of-anima3d-puzzle",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "screenshots": "node screenshots/capture-real-game.mjs",
+    "screenshots:manual": "node screenshots/scripts/capture-screenshots.mjs",
+    "screenshots:all": "node screenshots/capture-all-levels.mjs",
+    "screenshots:preview": "node screenshots/capture-preview.mjs",
+    "screenshots:gallery": "node screenshots/capture-gallery.mjs"
+  },
+  "dependencies": {
+    "@capacitor-community/admob": "^8.0.0",
+    "@capacitor/core": "^8.0.1",
+    "@google/genai": "^1.36.0",
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.5.0",
+    "cordova-plugin-purchase": "^13.13.0",
+    "puppeteer-screen-recorder": "^3.0.6",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^8.0.1",
+    "@capacitor/ios": "^8.0.1",
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "puppeteer": "^23.11.1",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}

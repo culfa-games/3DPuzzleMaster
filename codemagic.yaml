@@ -1,0 +1,341 @@
+workflows:
+  ios-capacitor:
+    name: iOS Capacitor Build
+    instance_type: mac_mini_m2
+    environment:
+      groups:
+        - ios_creds
+      vars:
+        XCODE_WORKSPACE: "ios/App/App.xcworkspace"
+        XCODE_SCHEME: "App"
+        BUNDLE_ID: "com.irokagames.blockbuster3D"
+        APP_STORE_APP_ID: "6757984329"
+        CAPACITOR_USE_SPM: "false"
+        # App Store Connect info from screenshots and provided key
+        APP_STORE_CONNECT_ISSUER_ID: "1ed439ef-1469-4991-8ca6-ef84e0c9687f"
+        APP_STORE_CONNECT_KEY_IDENTIFIER: "95J8R9654M"
+        TEAM_ID: "L5ZJQX746J"
+        APP_SKU: "34t5345667JSN"
+      node: 22
+      xcode: latest
+      cocoapods: default
+    triggering:
+      events:
+        - push
+        - tag
+        - pull_request
+      branch_patterns:
+        - pattern: "*"
+          include: true
+    scripts:
+      - name: Install dependencies
+        script: |
+          npm install
+      - name: Build web app
+        script: |
+          npm run build
+      - name: Capacitor Sync
+        script: |
+          # 1. Start Fresh: Install Dependencies
+          npm install --force
+          
+          # 2. Hard Reset: Re-create iOS Platform
+          # This ensures no stale file references (fixes duplicate symbols) and restores standard Podfile
+          echo "Re-creating iOS platform..."
+          
+          # Backup resources (Icons/Splash)
+          mkdir -p /tmp/cap_resources
+          [ -d "resources" ] && cp -r resources /tmp/cap_resources/
+          
+          # Nuke ios folder
+          rm -rf ios
+          
+          # Add platform fresh
+          npx cap add ios
+          
+          # Force CocoaPods usage by creating a Podfile manually
+          # Only if it wasn't restored from backup
+          if [ ! -f "ios/App/Podfile" ]; then
+             echo "Creating default Podfile to force CocoaPods..."
+             printf "platform :ios, '15.0'\nuse_frameworks! :linkage => :static\n\ntarget 'App' do\n  pod 'Capacitor', :path => '../../node_modules/@capacitor/ios'\n  pod 'CapacitorCordova', :path => '../../node_modules/@capacitor/ios'\nend\n" > ios/App/Podfile
+          fi
+          
+          # Restore resources and generate assets
+           if [ -d "/tmp/cap_resources/resources" ]; then
+             cp -r /tmp/cap_resources/resources ./
+             echo "Generating iOS Assets (Icons/Splash)..."
+             npx @capacitor/assets generate --ios
+          fi
+          
+          # 3. Standard Sync (This will populate the Podfile if it exists)
+          npx cap sync ios
+          
+          # 4. Patch IAP plugins (CordovaPluginPurchase missing Foundation imports)
+          echo "Patching IAP plugins..."
+          find ios -name "FileUtility.[hm]" -exec sed -i '' '1s/^/#import <Foundation\/Foundation.h>\n/' {} +
+          
+          # 5. Disable Export Compliance and Configure AdMob
+          if [ -f "ios/App/App/Info.plist" ]; then
+             echo "Configuring Info.plist for AdMob and Permissions..."
+             plutil -replace ITSAppUsesNonExemptEncryption -bool false ios/App/App/Info.plist
+             
+             # Update CFBundleShortVersionString to 1.0.3 (Required for App Store submission)
+             plutil -replace CFBundleShortVersionString -string "1.0.3" ios/App/App/Info.plist
+             
+             # AdMob App ID (CRITICAL: App will crash without this)
+             plutil -replace GADApplicationIdentifier -string "ca-app-pub-1365772215119360~6970052548" ios/App/App/Info.plist
+             
+             # App Tracking Transparency Description (Must be in English)
+             plutil -replace NSUserTrackingUsageDescription -string "This identifier will be used to deliver personalized ads to you." ios/App/App/Info.plist
+             
+             # iPad Full Screen Requirement (Fixes Multitasking validation error)
+             plutil -replace UIRequiresFullScreen -bool true ios/App/App/Info.plist
+
+             # Add SKAdNetworkItems for AdMob
+             plutil -insert SKAdNetworkItems -xml "<array><dict><key>SKAdNetworkIdentifier</key><string>cstr6suwn9.skadnetwork</string></dict></array>" ios/App/App/Info.plist
+          fi
+          
+          # 6. Ensure Pods are installed (Critical for creating .xcworkspace)
+          # 'cap sync' might just copy plugins but not install pods in CI environment sometimes
+          echo "Running explicit pod update..."
+          cd ios/App && pod install --repo-update
+      - name: Install pods
+        script: |
+          if [ -f "ios/App/Podfile" ]; then
+            cd ios/App
+            pod install --repo-update
+          else
+            echo "Skipping pod install (No Podfile)."
+          fi
+      - name: Set up keychain
+        script: |
+          keychain initialize
+      - name: Check Variables
+        script: |
+          # This step does not print secret data, only checks if variables are defined.
+          [ -z "$APP_STORE_CONNECT_ISSUER_ID" ] && echo "ERROR: APP_STORE_CONNECT_ISSUER_ID is empty!" || echo "ISSUER_ID loaded."
+          [ -z "$APP_STORE_CONNECT_KEY_IDENTIFIER" ] && echo "ERROR: APP_STORE_CONNECT_KEY_IDENTIFIER is empty!" || echo "KEY_ID loaded."
+          [ -z "$APP_STORE_CONNECT_PRIVATE_KEY" ] && echo "ERROR: APP_STORE_CONNECT_PRIVATE_KEY is empty!" || echo "PRIVATE_KEY loaded."
+      - name: Fetch signing files
+        script: |
+          # 1. Clean and prepare directories
+          rm -rf $HOME/certificates $HOME/profiles
+          mkdir -p $HOME/certificates $HOME/profiles
+          
+          # DEBUG: Check environment variables
+          echo "DEBUG: Checking environment variables..."
+          if [ -z "$APP_STORE_CONNECT_PRIVATE_KEY" ]; then
+              echo "ERROR: APP_STORE_CONNECT_PRIVATE_KEY is empty or not set."
+              echo "Available environment variables (masked):"
+              env | grep APP_STORE | sed 's/=.*/=******/'
+              echo "Please ensure 'APP_STORE_CONNECT_PRIVATE_KEY' is added to the 'ios_creds' group in Codemagic environment variables."
+              exit 1
+          fi
+          echo "APP_STORE_CONNECT_PRIVATE_KEY length: ${#APP_STORE_CONNECT_PRIVATE_KEY}"
+
+          # Fix potential key formatting issues using Python for reliability (Support Base64 and Raw)
+          echo "Fixing private key formatting..."
+          cat <<EOF > /tmp/fix_key.py
+          import os
+          import sys
+          import base64
+
+          try:
+              key = os.environ.get('APP_STORE_CONNECT_PRIVATE_KEY', '').strip()
+              if not key:
+                  print("Python Error: Key is empty")
+                  sys.exit(1)
+              
+              print(f"Key length found: {len(key)}")
+
+              # Auto-detect Base64 (if it doesn't look like a PEM header)
+              if "-----BEGIN PRIVATE KEY-----" not in key:
+                  print("Checking if key is Base64 encoded...")
+                  try:
+                      # Add padding just in case
+                      missing_padding = len(key) % 4
+                      if missing_padding:
+                          key += '=' * (4 - missing_padding)
+                      
+                      decoded_bytes = base64.b64decode(key)
+                      decoded_str = decoded_bytes.decode('utf-8')
+                      
+                      if "-----BEGIN PRIVATE KEY-----" in decoded_str:
+                          key = decoded_str
+                          print("Success: Key was Base64 encoded. Decoded.")
+                  except Exception as e:
+                      print(f"Not Base64 or decode failed: {e}. Treating as raw string.")
+              
+              # Now ensure clean newlines for PEM format
+              # 1. Replace literal escaped \n with real newlines
+              if '\\n' in key:
+                  key = key.replace('\\n', '\n')
+              
+              # 2. Re-construct to ensure valid structure
+              header = "-----BEGIN PRIVATE KEY-----"
+              footer = "-----END PRIVATE KEY-----"
+              
+              if header in key and footer in key:
+                  # Remove headers to isolate body
+                  body = key.replace(header, '').replace(footer, '').strip()
+                  # Remove all whitespaces/newlines from body to make it pure base64 payload
+                  body = "".join(body.split())
+                  
+                  key = f"{header}\n{body}\n{footer}"
+                  
+              with open('/tmp/private_key.p8', 'w') as f:
+                  f.write(key)
+              print("Key saved to /tmp/private_key.p8")
+              
+          except Exception as e:
+              print(f"Error processing key: {e}")
+              sys.exit(1)
+          EOF
+          
+          python3 /tmp/fix_key.py
+          
+          # Generate a fresh 2048-bit RSA key for the certificate to ensure creation works
+          echo "Generating new 2048-bit RSA key for the certificate..."
+          openssl genrsa -out /tmp/cert_private_key.pem 2048
+          
+          echo "### STEP 1: MANUALLY CREATE AND SAVE CERTIFICATE ###"
+          # This command creates a new certificate on Apple and saves the .p12 file to the specified location.
+          # If certificate already exists (409 error), ignore this error and continue
+          CERT_OUTPUT=$(app-store-connect certificates create \
+            --issuer-id "$APP_STORE_CONNECT_ISSUER_ID" \
+            --key-id "$APP_STORE_CONNECT_KEY_IDENTIFIER" \
+            --private-key "$(cat /tmp/private_key.p8)" \
+            --certificate-key "$(cat /tmp/cert_private_key.pem)" \
+            --type IOS_DISTRIBUTION \
+            --save \
+            --p12-password "codemagic" \
+            --p12-path "$HOME/certificates/signing.p12" 2>&1) || CERT_EXIT=$?
+          
+          if echo "$CERT_OUTPUT" | grep -q "already have a current\|pending certificate request"; then
+            echo "Certificate already exists, using existing certificate..."
+          elif [ ${CERT_EXIT:-0} -eq 0 ]; then
+            echo "New certificate successfully created."
+          else
+            echo "Certificate creation error: $CERT_OUTPUT"
+            echo "Continuing (existing certificate might be usable)..."
+          fi
+
+          echo "### STEP 2: FETCH PROFILES ###"
+          # We are not using '--create' here anymore, expecting it to use the certificate we saved above.
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --issuer-id "$APP_STORE_CONNECT_ISSUER_ID" \
+            --key-id "$APP_STORE_CONNECT_KEY_IDENTIFIER" \
+            --private-key "$(cat /tmp/private_key.p8)" \
+            --certificate-key "$(cat /tmp/cert_private_key.pem)" \
+            --create \
+            --type IOS_APP_STORE \
+            --certificates-dir "$HOME/certificates" \
+            --profiles-dir "$HOME/profiles" \
+            --strict-match-identifier
+      - name: Add certificates
+        script: |
+          echo "DEBUG: Listing generated certificates..."
+          ls -la $HOME/certificates
+          
+          echo "Copying certificate(s) to default search path..."
+          mkdir -p $HOME/Library/MobileDevice/Certificates
+          # Copy ANY .p12 file found (filename might vary based on fetch step)
+          cp $HOME/certificates/*.p12 $HOME/Library/MobileDevice/Certificates/
+          
+          echo "Adding certificates to keychain..."
+          keychain add-certificates --certificate-password "codemagic"
+      - name: Set up code signing
+        script: |
+          echo "Setting up code signing..."
+          # Move profiles to standard location just in case
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $HOME/profiles/*.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+          
+          # Initialize provisioning with explicit project path and profile usage
+          xcode-project use-profiles --warn-only
+      - name: Increment build number
+        script: |
+          # Use Codemagic's auto-incrementing BUILD_NUMBER plus an offset to ensure it's higher than previous uploads
+          # Offset updated to 300 to skip conflict with 1xx and 2xx series
+          NEW_BUILD_NUMBER=$(($BUILD_NUMBER + 300))
+          echo "Updating build number to $NEW_BUILD_NUMBER"
+          cd ios/App && agvtool new-version -all $NEW_BUILD_NUMBER
+      - name: Build IPA
+        script: |
+          # 1. Find Correct Workspace File
+          WORKSPACE=$(find ios -maxdepth 3 -name "*.xcworkspace" | grep -v "xcodeproj" | head -1)
+          [ -z "$WORKSPACE" ] && WORKSPACE="ios/App/App.xcworkspace"
+          echo "Using Workspace: $WORKSPACE"
+
+          # 2. List Schemes and Capture Real Scheme Name
+          echo "Available Schemes:"
+          xcodebuild -list -workspace "$WORKSPACE"
+          
+          # Smart Scheme Detection: First search for 'App', otherwise take the first shared scheme
+          SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" 2>/dev/null | awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' | sed 's/^[[:space:]]*//' | grep -iE "App|Brain|Master" | head -1)
+          
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" 2>/dev/null | awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' | sed 's/^[[:space:]]*//' | head -1)
+          fi
+          
+          SCHEME=${SCHEME:-"App"}
+          echo "Selected Scheme: $SCHEME"
+
+          # 3. IPA Build (might need -sdk for build settings error but xcode-project handles it)
+          xcode-project build-ipa --workspace "$WORKSPACE" --scheme "$SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+      email:
+        recipients:
+          - user1@example.com # Replace with actual email
+        notify:
+          success: true
+          failure: true
+
+  android-capacitor:
+    name: Android Capacitor Build
+    instance_type: mac_mini_m2
+    environment:
+      groups:
+        - google_play # Create this group in Codemagic with CM_KEYSTORE etc.
+      node: 22
+      java: 17
+    triggering:
+      events:
+        - push
+        - tag
+        - pull_request
+      branch_patterns:
+        - pattern: "*"
+          include: true
+    scripts:
+      - name: Install dependencies
+        script: |
+          npm install
+      - name: Build web app
+        script: |
+          npm run build
+      - name: Capacitor Sync
+        script: |
+          npx cap sync android
+      - name: Build Android Release
+        script: |
+          cd android
+          chmod +x gradlew
+          ./gradlew bundleRelease
+    artifacts:
+      - android/app/build/outputs/bundle/release/*.aab
+      - android/app/build/outputs/apk/release/*.apk
+    publishing:
+      email:
+        recipients:
+          - user1@example.com
+        notify:
+          success: true
+          failure: true
