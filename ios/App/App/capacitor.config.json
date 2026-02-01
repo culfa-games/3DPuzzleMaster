@@ -1,0 +1,17 @@
+{
+	"appId": "com.irokagames.blockbuster3D",
+	"appName": "Block Buster 3D",
+	"webDir": "dist",
+	"ios": {},
+	"plugins": {
+		"StatusBar": {
+			"style": "DARK",
+			"overlaysWebView": true,
+			"backgroundColor": "#00000000"
+		}
+	},
+	"server": {
+		"androidScheme": "https"
+	},
+	"packageClassList": []
+}
